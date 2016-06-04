@@ -125,9 +125,10 @@ export interface MemberServices {
     /**
      * Register the member and return an enrollment secret.
      * @param req Registration request with the following fields: name, role
+     * @param registrar The identity of the registar (i.e. who is performing the registration)
      * @param cb Callback of the form: {function(err,enrollmentSecret)}
      */
-    register(req:RegistrationRequest, cb:RegisterCallback):void;
+    register(req:RegistrationRequest, registrar:Member, cb:RegisterCallback):void;
 
     /**
      * Enroll the member and return an opaque member object
@@ -156,9 +157,9 @@ export interface RegistrationRequest {
     // The enrollment ID of the member
     enrollmentID:string;
     // Roles associated with this member.
-    // Fabric roles include: 'user', 'peer', 'validator', 'auditor'
-    // Default value: ['user']
-    memberTypes?:string[];
+    // Fabric roles include: 'client', 'peer', 'validator', 'auditor'
+    // Default value: ['client']
+    roles?:string[];
     // Account name (TODO: remove when account is removed from member services)
     account:string;
     // Affiliation for a user
@@ -166,10 +167,10 @@ export interface RegistrationRequest {
     // 'registrar' enables this identity to register other members with types
     // and can delegate the 'delegationRoles' roles
     registrar?:{
-        // The allowable member types which this member can register
-        memberTypes:string[],
-        // The allowable member types which can be registered by members registered by this member
-        delegationMemberTypes?:string[]
+        // The allowable roles which this member can register
+        roles:string[],
+        // The allowable roles which can be registered by members registered by this member
+        delegateRoles?:string[]
     };
 }
 
@@ -722,7 +723,7 @@ export class Member {
             debug("previously registered, enrollmentSecret=%s", enrollmentSecret);
             return cb(null, enrollmentSecret);
         }
-        self.memberServices.register(registrationRequest, function (err, enrollmentSecret) {
+        self.memberServices.register(registrationRequest, self.chain.getRegistrar(), function (err, enrollmentSecret) {
             debug("memberServices.register err=%s, secret=%s", err, enrollmentSecret);
             if (err) return cb(err);
             self.enrollmentSecret = enrollmentSecret;
@@ -1576,17 +1577,43 @@ class MemberServicesImpl implements MemberServices {
     /**
      * Register the member and return an enrollment secret.
      * @param req Registration request with the following fields: name, role
+     * @param registrar The identity of the registrar (i.e. who is performing the registration)
      * @param cb Callback of the form: {function(err,enrollmentSecret)}
      */
-    register(req:RegistrationRequest, cb:RegisterCallback):void {
-        var self = this;
-        debug("MemberServicesImpl.register %j", req);
+    register(req:RegistrationRequest, registrar:Member, cb:RegisterCallback):void {
+        let self = this;
+        debug("MemberServicesImpl.register: req=%j", req);
         if (!req.enrollmentID) return cb(new Error("missing req.enrollmentID"));
-        var protoReq = new _caProto.RegisterUserReq();
-        protoReq.setId({id: req.enrollmentID});
-        protoReq.setRole(memberTypesToMask(req.memberTypes));
+        if (!registrar) return cb(new Error("chain registrar is not set"));
+        let protoReq = new _caProto.RegisterUserReq();
+        protoReq.setId({id:req.enrollmentID});
+        protoReq.setRole(rolesToMask(req.roles));
         protoReq.setAccount(req.account);
         protoReq.setAffiliation(req.affiliation);
+        // Create registrar info
+        let protoRegistrar = new _caProto.Registrar();
+        protoRegistrar.setId({id:registrar.getName()});
+        if (req.registrar) {
+            if (req.registrar.roles) {
+               protoRegistrar.setRoles(req.registrar.roles);
+            }
+            if (req.registrar.delegateRoles) {
+               protoRegistrar.setDelegateRoles(req.registrar.delegateRoles);
+            }
+        }
+        protoReq.setRegistrar(protoRegistrar);
+        // Sign the registration request
+        var buf = protoReq.toBuffer();
+        var signKey = self.cryptoPrimitives.ecdsaKeyFromPrivate(registrar.getEnrollment().key, 'hex');
+        var sig = self.cryptoPrimitives.ecdsaSign(signKey, buf);
+        protoReq.setSig( new _caProto.Signature(
+            {
+                type: _caProto.CryptoType.ECDSA,
+                r: new Buffer(sig.r.toString()),
+                s: new Buffer(sig.s.toString())
+            }
+        ));
+        // Send the registration request
         self.ecaaClient.registerUser(protoReq, function (err, token) {
             debug("register %j: err=%j, token=%s", protoReq, err, token);
             if (cb) return cb(err, token ? token.tok.toString() : null);
@@ -1908,12 +1935,12 @@ function parseUrl(url:string):any {
 }
 
 // Convert a list of member type names to the role mask currently used by the peer
-function memberTypesToMask(memberTypes?:string[]):number {
+function rolesToMask(roles?:string[]):number {
     let mask:number = 0;
-    if (memberTypes) {
-        for (let memberType in memberTypes) {
-            switch (memberType) {
-                case 'user':
+    if (roles) {
+        for (let role in roles) {
+            switch (role) {
+                case 'client':
                     mask |= 1;
                     break;       // Client mask
                 case 'peer':
